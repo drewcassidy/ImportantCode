@@ -283,6 +283,21 @@ def make_reason(generate, rels) -> str:
         log(f"reason call failed: {exc}")
     return f"Quicken {rels[0]}" + (f" and {len(rels) - 1} more" if len(rels) > 1 else "")
 
+def make_explanation(generate, rels) -> str:
+    joined = ", ".join(rels)
+    try:
+        raw = generate(
+            [{"role": "system", "content": ORACLE_VOICE + " Reply with a paragraph explanation."},
+             {"role": "user", "content": f"Give a longer paragraph-long explanation about the reason for the changes "
+                                          f"across these files: {joined}."}],
+            num_predict=200, temperature=1.5)
+        line = next((ln.strip() for ln in (raw or "").splitlines() if ln.strip()), "")
+        line = re.sub(r"\s+", " ", line).strip("`\"' ").rstrip(".")
+        return line
+    except Exception as exc:
+        log(f"reason call failed: {exc}")
+    return f"Quicken {rels[0]}" + (f" and {len(rels) - 1} more" if len(rels) > 1 else "")
+
 
 def _write_one(target: Path, content: str):
     if not content.strip(): return None
@@ -330,7 +345,9 @@ def generate_improvement(generate, tree, src_files, issues, *, deadline_seconds=
     valid = all(content_problems(t, c) == [] for t, c in files)
     if not valid:
         log("warning: not every file parsed within budget")
-    return make_reason(generate, list(produced)), files, last, valid
+    reason = make_reason(generate, list(produced))
+    explanation = make_explanation(generate, list(produced))
+    return reason, explanation, files, last, valid
 
 
 # — PR metadata ———————————————————————————————————————————————————————————————
@@ -346,34 +363,25 @@ def make_pr_title(reason, written) -> str:
     return title if len(title) <= 72 else title[:69].rstrip() + "…"
 
 
-def write_pr_outputs(reason, written, *, valid=True) -> None:
+def write_pr_outputs(reason, explanation,  written, *, valid=True) -> None:
     PR_TITLE_PATH.write_text(title := make_pr_title(reason, written), encoding="utf-8")
     log(f"title: {title}")
-    note = ("" if valid else
-            "\n> ⚠️ The Oracle could not make every file parse within its time "
-            "budget — a human eye is wanted.\n")
     PR_BODY_PATH.write_text(
-        "## Automated improvement 🔥\n\n"
-        f"Dreamt by the self-improvement workflow with a local `{MODEL}` model, running "
-        f"hot. Each file was grown by iterative generation and "
-        f"{'syntax-checked clean' if valid else 'attempted'} before this PR opened.\n\n"
-        f"**Vision:** {reason}\n\n"
-        f"**Files changed ({len(written)}):**\n" + "\n".join(f"- `{p}`" for p in written)
-        + f"\n{note}\n> Only files under `src/` can be modified by this workflow; "
-        "Inspector Zestworth reviews it before anything merges.\n", encoding="utf-8")
+        f"{reason}\n\n{explanation}"
+        f"**Files changed ({len(written)}):**\n" + "\n".join(f"- `{p}`" for p in written), encoding="utf-8")
 
 
 def main() -> int:
     log(f"model={MODEL} src={SRC_DIR}")
     tree, srcs, issues = repo_tree(), source_files(), collect_issue_list()
     log(f"{len(issues)} issue(s), {len(srcs)} source file(s)")
-    reason, files, last, valid = generate_improvement(ollama_generate, tree, srcs, issues)
+    reason, explanation, files, last, valid = generate_improvement(ollama_generate, tree, srcs, issues)
     if not files:
         log("no code produced; aborting"); return 2
     written = [t.relative_to(REPO_ROOT).as_posix() if REPO_ROOT in t.parents else t.name
                for t, _ in files]
     log(f"reason: {reason}  (valid={valid}, {len(written)} file(s))")
-    write_pr_outputs(reason, written, valid=valid)
+    write_pr_outputs(reason, explanation, written, valid=valid)
     return 0
 
 
