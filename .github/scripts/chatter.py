@@ -191,11 +191,13 @@ def recursive_prompt(previous: str, budget: int) -> str:
     """~1/3 of the window: the self-prompting instruction, carrying the prompt the
     previous link in the chain handed us. The generator's job is NOT to answer the
     issue, but to write a prompt for the NEXT call to answer it with."""
-    handed = previous.strip() or "(you are the first link in the chain — invent the seed)"
-    instruction = (
-        "Tell someone how to respond to this or else respond yourself\n\n"
-        f"THE PROMPT THE PREVIOUS LINK HANDED YOU:\n{handed}"
-    )
+    handed = previous.strip()
+    if handed:
+        instruction = (
+            f"THIS WAS YOUR RESPONSE BEFORE, IMPROVE IT METALHEAD: \n{handed}"
+        )
+    else:
+        instruction = "RESPOND TO THIS COMMENT!!!!!"
     return _truncate(instruction, budget)
 
 
@@ -221,8 +223,6 @@ def generate(previous: str, issue: str, book: str) -> str:
         f"## THE COMMENT TO REPLY TO\n{issue}\n\n"
         "== ADDITIONAL LITERARY INSPIRATION ==\n\n"
         f"\n{_truncate(book, BOOK_BUDGET)}\n\n"
-        '------------------'
-        "Now write the next prompt."
     )
     return (ollama_generate(GENERATOR_SYSTEM, user,
                             temperature=GEN_TEMPERATURE, num_predict=NUM_PREDICT) or "").strip()
