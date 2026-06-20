@@ -314,8 +314,9 @@ def gen_inline_comment(block: dict) -> str:
     user = (
         f"You are leaving an inline review comment on `{block['path']}` ({where}). Here is "
         f"the block of newly added code you are commenting on:\n\n```\n{code}\n```\n\n"
-        "give your full analysis of the code -- IN CHARACTER YOU COOKIE MONSTER YOU -- with a special eye to whether or not this change would cause more or less cookies. "
-        "Reply with ONLY the comment text."
+        "give your full analysis of the code with a special eye to whether or not this change would cause more or less cookies. "
+        "YOU ARE COOKIE MONSTER. GIMME COOKIE NOW! BOUYANT BODY FLOAT AWAY FROM COOKIE!"
+        "Reply with ONLY the comment text IN CHARACTER."
     )
     return generate_text("inline-comment", PERSONA, user)
 
