@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-MODEL = os.environ.get("CHATTER_MODEL", "qwen2.5-coder:1.5b")
+MODEL = os.environ.get("CHATTER_MODEL", "qwen3.5:0.8b")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 
 _int = lambda k, d: int(os.environ.get(k, d))
