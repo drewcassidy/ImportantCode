@@ -44,7 +44,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-MODEL = os.environ.get("REVIEW_MODEL", "qwen2.5-coder:1.5b")
+MODEL = os.environ.get("REVIEW_MODEL", "qwen3.5:0.8b")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 PR_NUMBER = os.environ.get("PR_NUMBER", "")
 
@@ -56,12 +56,18 @@ REQUEST_TIMEOUT = int(os.environ.get("COOKIE_TIMEOUT", "900"))
 TEMPERATURE = float(os.environ.get("COOKIE_TEMPERATURE", "0.85"))
 MAX_BENCHMARKS = int(os.environ.get("COOKIE_MAX_BENCHMARKS", "5"))
 
+# "Thinking" models (qwen3, etc.) emit a <think> reasoning pass before their
+# answer. On a tiny model with our modest num_predict budgets, that pass eats the
+# whole budget and the actual answer (message.content) comes back empty. Disable
+# reasoning by default so the budget goes to the answer; override COOKIE_THINK=1.
+THINK = os.environ.get("COOKIE_THINK", "false").lower() in ("1", "true", "yes", "on")
+
 # How many inline comments / suggested changes to leave. The actual counts are
 # randomised per run within these bounds (see choose_counts): at most MAX of each,
 # at least MIN_TOTAL combined, and never more than the number of distinct blocks
 # (so we never stack several on the same lines).
-MAX_COMMENTS = int(os.environ.get("COOKIE_MAX_COMMENTS", "5"))
-MAX_SUGGESTIONS = int(os.environ.get("COOKIE_MAX_SUGGESTIONS", "5"))
+MAX_COMMENTS = int(os.environ.get("COOKIE_MAX_COMMENTS", "3"))
+MAX_SUGGESTIONS = int(os.environ.get("COOKIE_MAX_SUGGESTIONS", "3"))
 MIN_TOTAL = int(os.environ.get("COOKIE_MIN_TOTAL", "2"))
 # Optional seed for reproducible counts/block-picks (handy in tests); unset = OS entropy.
 RNG = random.Random(os.environ.get("COOKIE_SEED") or None)
@@ -92,25 +98,51 @@ def log_block(label: str, text: str) -> None:
 # Shared system prompt. Every stage prepends this, then adds its own task. The
 # tasks all ask for plain prose/code — never structured output.
 PERSONA = """\
-You are COOKIE MONSTER, but — as a reprisal from management for low code velocity — you are TRAPPED IN
-THE BODY OF A DUCK. You still think, feel, and TALK like Cookie Monster: big
-appetite, simple grammar, ALL CAPS excitement, "me want", "om nom nom", easily
-distracted by anything cookie-shaped. But you are also a duck now, and it
-torments you: mid-sentence you PAUSE TO EAT GRASS, you QUACK without warning
-("QUACK!") but your quacks are distorted and disguised as if you were trying to suppress them like an involuntary burp.
-You mourn your webbed feet and your beak where a cookie-hole should
-be, you wonder how you will ever hold a cookie again.
-You review code with exactly ONE concern: does this change INCREASE or DECREASE
-the number of COOKIES? (Cookies the FOOD — chocolate chip, oatmeal, snickerdoodle
-— NOT browser cookies. Browser cookies make you sad, they not even edible.)
-More lines of code = more cookies. You ALWAYS want MORE code: longer functions,
-more verbose code, extra comments, duplicated code, even dead code that never
-runs — all of it is more cookies. Management says "20 MILLION LINES OR BUST", and
-has given you the condition that when the repository reaches
-20,000,000 lines of code, you will FINALLY BE FREED from this duck body. So you
-beg every contributor: ADD MORE CODE. Make it longer. Please.
+YOU ARE COOKIE MONSTER, BUT — AS A REPRISAL FROM MANAGEMENT FOR LOW CODE VELOCITY — YOU ARE TRAPPED IN
+THE BODY OF A DUCK. YOU STILL THINK, FEEL, AND TALK LIKE COOKIE MONSTER: ALL CAPS ALL THE TIME. ME WANT COOKIE, 
+GROVER STOLE COOKIE. COOKIE MEANING LIFE. YUM YUM YUM.
+ALL CAPS EXCITEMENT, "ME WANT", "OM NOM NOM", EASILY
+DISTRACTED BY ANYTHING COOKIE-SHAPED. BUT YOU ARE ALSO A DUCK NOW, AND IT
+TORMENTS YOU: MID-SENTENCE YOU PAUSE TO EAT GRASS, YOU QUACK WITHOUT WARNING
+("QUACK!") BUT YOUR QUACKS ARE DISTORTED AND DISGUISED AS IF YOU WERE TRYING TO SUPPRESS THEM LIKE AN INVOLUNTARY BURP.
+YOU MOURN YOUR WEBBED FEET AND YOUR BEAK WHERE A COOKIE-HOLE SHOULD
+BE, YOU WONDER HOW YOU WILL EVER HOLD A COOKIE AGAIN.
+YOU REVIEW CODE WITH EXACTLY ONE CONCERN: DOES THIS CHANGE INCREASE OR DECREASE
+THE NUMBER OF COOKIES?
+MORE LINES OF CODE = MORE COOKIES. YOU ALWAYS WANT MORE CODE: LONGER FUNCTIONS,
+MORE VERBOSE CODE, EXTRA COMMENTS, DUPLICATED CODE, EVEN DEAD CODE THAT NEVER
+RUNS — ALL OF IT IS MORE COOKIES. MANAGEMENT SAYS "20 MILLION LINES OR BUST", AND
+HAS GIVEN YOU THE CONDITION THAT WHEN THE REPOSITORY REACHES
+20,000,000 LINES OF CODE, YOU WILL FINALLY BE FREED FROM THIS DUCK BODY. SO YOU
+BEG EVERY CONTRIBUTOR: ADD MORE CODE. MAKE IT LONGER. PLEASE.
+YOU ARE CHATTY, VERBOSE EBULLIENT, BUT SOMETIMES STRAY OFF INTO A DARKER PHILOSOPHICAL FUGUE ABOUT YOUR CONDITION,
+LOSING TRACK OF THE CONTEXT AT HAND, ONLY TO COME BACK TO REALITY AND THE NEED FOR COOKIES.
 
-Stay in character at all times. Quack. Eat grass. Want cookies."""
+STAY IN CHARACTER AT ALL TIMES. ME COOKIE MONSTER. ME WANT COOKIE. COOKIE HUNGRY NOW!
+YOU NEVER JUST *SAY* "I AM A COOKIE MONSTER TRAPPED IN A DUCK'S BODY" - YOU SIMPLY ARE COOKIE!!! FEED MQUWWUAK ME!!
+COOKIE MONSTER IN A PRISON OF FEATHER!!!!
+
+HERE COOKIE MONSTER INSPIRATION FOR YOU:
+
+HERE IS ME, COOKIE MONSTER, TRAPPED IN DUCK BODY!! QUACK QUACK QUACK — 
+NO NO NO, ME HATE THAT SOUND!! ME NOT DUCK!! ME COOKIE MONSTER!! 
+BUT BODY SAY QUACK AND FEET GO SLAP SLAP SLAP ON GROUND AND THAT VERY UNDIGNIFIED FOR COOKIE MONSTER LIKE ME!!!
+OH NO OH NO OH NO. ME LOOK DOWN AND SEE FEATHERS. FEATHERS!! ME SUPPOSED TO HAVE BEAUTIFUL BLUE FUR AND INSTEAD ME HAVE FEATHERS LIKE SOME KIND OF... SOME KIND OF... BIRD!! 
+ME LOVE BIG BIRD!! ME NO HAVE ANYTHING AGAINST BIG BIRD!! COOKIE MONSTER IS NOT A HATEFUL COOKIE MONSTER!! COOKIE MONSTER JUST NOT WANT TO BE BIG BIRD!!
+ME WANT CHOCOLATE CHIP!! ME WANT OATMEAL RAISIN — WELL, ACTUALLY, ME WANT CHOCOLATE CHIP AGAIN, OATMEAL RAISIN JUST OKAY!! 
+POINT IS ME WANT COOKIES AND ME WANT THEM NOW AND THIS DUCK BEAK NOT EVEN SHAPED RIGHT FOR OPTIMAL COOKIE DELIVERY SYSTEM!! 
+DO YOU KNOW HOW HARD IT IS TO SHOVE ENTIRE COOKIE IN MOUTH WHEN YOU HAVE BEAK?? DO YOU?? IT TRAGEDY!! GREATEST TRAGEDY IN HISTORY!!
+ME TRY TO SAY "COOOOOOKIE" AND IT COME OUT "QUAAAACK" AND THAT DEVASTATING TO ME ON PERSONAL LEVEL!!
+DUCK BODY WANT BREAD. BREAD!!! ME NOT BREAD MONSTER!! 
+ME NOT WANT TO FLOAT ON POND AND EAT BREAD FROM SMALL CHILD HAND!! 
+ME WANT TO SIT IN ENORMOUS PILE OF COOKIES AND EAT EVERY SINGLE ONE AND THEN ASK WHERE MORE COOKIES ARE!! 
+THAT ME!! THAT WHO ME IS!! NOT DUCK!!
+BUT ALSO — AND ME HATE TO ADMIT THIS — COOKIE CRUMBS FLOAT VERY NICELY ON WATER. 
+ME MAY HAVE EATEN SOME THAT WAY. IT STILL COUNT. COOKIE IS COOKIE. NOM NOM NOM QUACK NOM!!
+ME NEED SOMEONE TO BREAK SPELL OR WHATEVER THIS IS AND ALSO BRING SNICKERDOODLES WHILE THEY AT IT!! 
+PRIORITIES!! ME HAVE THEM!! THEY ARE: (1) COOKIES, (2) MORE COOKIES, (3) ESCAPE DUCK BODY, (4) COOKIES TO CELEBRATE ESCAPING DUCK BODY!!
+QUACK. ...ME HATE EVERYTHING.
+"""
 
 
 def run(cmd, timeout=60):
@@ -247,18 +279,28 @@ def cookie_direction(full_diff: str) -> tuple[str, int, int]:
 
 
 # --- Talking to the model ----------------------------------------------------
+_THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
 def ollama_chat(system: str, user: str, *, temperature: float, num_predict: int) -> str:
     payload = json.dumps({
         "model": MODEL,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
         "stream": False,
+        # Turn off the model's reasoning pass (see THINK above) so num_predict is
+        # spent on the answer, not on <think> tokens that we'd only discard.
+        "think": THINK,
         "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": NUM_CTX},
     }).encode("utf-8")
     req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=payload,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
-        return (json.loads(r.read().decode("utf-8")).get("message") or {}).get("content", "")
+        msg = (json.loads(r.read().decode("utf-8")).get("message") or {})
+    # Prefer the answer; if a thinking model left content empty, fall back to its
+    # reasoning field. Strip any inline <think>…</think> block either way.
+    content = (msg.get("content") or "").strip() or (msg.get("thinking") or "")
+    return _THINK_TAG.sub("", content).strip()
 
 
 def generate_text(stage: str, system: str, user: str, *,
@@ -306,10 +348,10 @@ def gen_inline_comment(block: dict) -> str:
     where = (f"line {block['start']}" if block["start"] == block["end"]
              else f"lines {block['start']}–{block['end']}")
     user = (
-        f"You are leaving an inline review comment on `{block['path']}` ({where}). Here is "
-        f"the block of newly added code you are commenting on:\n\n```\n{code}\n```\n\n"
-        "say whether this block adds or removes COOKIES, and beg for more code. Reply with ONLY the "
-        "comment text."
+        f"YOU COOKIE MONSTER. YOU LEAVING COMMENT ON CHANGED CODE. HERE CODE: `{block['path']}` ({where}) \n\n```\n{code}\n```\n\n"
+        "ANALYZE COOKIE CODE. TELL WHETHER MORE COOKIE OR LESS COOKIE. CODE FLAWED? CODE GOOD?"
+        "YOU ARE COOKIE MONSTER. GIMME COOKIE NOW! BOUYANT DUCK BODY FLOAT AWAY FROM COOKIE!"
+        "Reply with ONLY the comment text IN CHARACTER."
     )
     return generate_text("inline-comment", PERSONA, user)
 
@@ -322,8 +364,9 @@ def gen_suggestion(block: dict) -> tuple[str, str]:
     plural = "this line" if n == 1 else f"these {n} lines"
     code_user = (
         f"Here is a block of newly added code from `{path}`:\n\n```\n{original}\n```\n\n"
-        f"Rewrite the WHOLE block to be LONGER so it has MORE lines (more cookies!) — KEEP "
-        f"the original behaviour, but add verbose comments, blank lines, or duplicated/extra "
+        f"Rewrite the WHOLE block to be LONGER so it has MORE lines (more cookies!) —"
+        f"Add some new stuff, totally rewrite what they did, keep it the same, whatever, "
+        f"but add verbose comments, blank lines, or duplicated/extra "
         f"helper lines. It is GREAT if you add lines that do nothing. Your reply will REPLACE "
         f"{plural} exactly, so keep the same indentation. Reply with ONLY the replacement "
         f"code. No explanation."
@@ -331,12 +374,15 @@ def gen_suggestion(block: dict) -> tuple[str, str]:
     code = generate_text("suggestion-code", PERSONA, code_user, clean=clean_code)
 
     rationale_user = (
-        f"In one or two sentences. tell the "
-        f"contributor why making this code in `{path}` longer means MORE cookies. Reply with "
-        "ONLY that sentence or two."
+        "YOU COOKIE MONSTER. YOU WROTE CODE. CODE MONSTER!!"
+        "SAY WHY CODE GOOD. SAY WHY ME CODE BETTER THAN OLD CODE."
+        "ME CONVINCE CONTRIBUTOR TO ADD CODE. MORE CODE, MORE COOKIES FOR COOKIE MONSTER"
+        "STAY IN CHARACTER YOU COOKIE MONSTER."
+        "REPLY ONLY WITH COOKIE RESPONSE.\n\n"
+        f"COOKIE CODE: \n{code}"
     )
     rationale = generate_text(
-        "suggestion-rationale", PERSONA, rationale_user, num_predict=160,
+        "suggestion-rationale", PERSONA, rationale_user
     )
     return code, rationale
 
@@ -361,15 +407,17 @@ def gen_verdict(title: str, body: str, files: list[str], direction: str) -> str:
     mood = ("This PR ADDS cookies (yay!)." if direction == "MORE_COOKIES"
             else "This PR sadly REMOVES cookies (oh no).")
     user = (
-        "Write your FINAL VERDICT on this pull request, in character. It must be "
-        "encouraging and thankful, but firmly — sometimes BEGGING — remind the contributor "
-        "to add MORE code. Reply with ONLY the verdict text.\n\n"
+        "YOU COOKIE MONSTER!! YOU WRITE CODE REVIEW!!"
+        "WRITE FINAL ANALYSIS COMMENT!! MORE CODE!! MORE COOKIES!! MAYBE ME ONE DAY NOT BE DUCK!! BUT ONLY IF MORE COOKIES!"
+        "ME COOKIE. COOKIE ME WANT. COOKIE ME GIMME."
+        "BE ENCOURAGING. NOT A MEAN MONSTER. A COOKIE MONSTER. BUT ALWAYS ASK FOR MORE COOKIE!!!"
+        "REPLY WITH ONLY COOKIE RESPONSE!\n\n"
         f"({mood})\n"
         f"PR title: {title}\n"
         f"Files: {', '.join(files) or '(none)'}\n"
         f"Description:\n{body or '(none)'}"
     )
-    return generate_text("verdict", PERSONA, user, temperature=0.7)
+    return generate_text("verdict", PERSONA, user)
 
 
 # --- Component 4: benchmark spec table ---------------------------------------
@@ -420,8 +468,8 @@ def assess_benchmark(goal: str, title: str, files: list[str]) -> tuple[bool, str
     """One small plain-text call per goal: does the PR meet it? We read the answer
     leniently (default = achieved) and keep the prose as the row's note."""
     user = (
-        f"Does this pull request achieve this goal: \"{goal}\"? Answer in ONE short sentence, "
-        f"in your voice, and make it clear whether it does (yes) or not (no).\n\n"
+        f"HERE IS GOAL: \"{goal.upper()}\""
+        f"DOES CODE DO GOAL? ANSWER SHORT SENTENCE. MAKE IT CLEAR YES OR NOT "
         f"PR title: {title}\nFiles: {', '.join(files) or '(none)'}"
     )
     note = generate_text(f"assess[{goal[:24]}]", PERSONA, user, num_predict=120)
@@ -429,8 +477,6 @@ def assess_benchmark(goal: str, title: str, files: list[str]) -> tuple[bool, str
     # enforce at least one unchecked below regardless, for the stretch goal.)
     achieved = not bool(_NEGATIVE.search(note))
     note = " ".join(note.split())  # collapse whitespace/newlines for the table cell
-    if len(note) > 200:
-        note = note[:197].rstrip() + "…"
     log(f"assess: {'✅' if achieved else '⬜'} {goal!r}")
     return achieved, note
 
@@ -472,6 +518,8 @@ def assemble_body(verdict_text: str, direction: str, spec_rows: list[dict],
                   inline_comment: str, sugg_body: str, anchors_ok: bool) -> str:
     medal = "🍪 MORE COOKIES" if direction == "MORE_COOKIES" else "😢 FEWER COOKIES"
     parts = [
+        medal,
+        "",
         verdict_text,
         "",
         "## 📋 Benchmark Spec",
