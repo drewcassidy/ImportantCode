@@ -8,14 +8,23 @@ Dependency-free (stdlib only). Triggered by the workflow whenever an issue is
 opened or a comment is created, it:
 
   1. Fetches a random slice of a Project Gutenberg book, for a little literary flair.
-  2. Runs a CHAIN that bounces between two local Ollama agents:
-       • the GENERATOR — its context is, by design, ~1/3 a recursive prompt that
-         tells it to dream up a prompt for the *next* call to reply to the issue,
-         ~30% the issue/comment text, and ~30% the borrowed book passage.
+  2. Pulls the prior comment history on the issue from the GitHub API (the most
+     recent comments, trimmed to fit the context window) so the reply lands in
+     the conversation rather than out of nowhere.
+  3. Runs a CHAIN that bounces between two local Ollama agents. Each call is built
+     from a *list of messages*, not one mashed-together string: instructions live
+     in system messages, while the comment thread and the literary passage are
+     separate user messages.
+       • the GENERATOR — sees its persona + task as system messages, the borrowed
+         book as a clearly-fenced "stylistic muse" user message (voice only, not a
+         thing to reply to), and the comment thread as user messages ending with
+         the comment it must answer. A rejected prior draft is fed back as a
+         system "improve this" message (self-prompting). It thinks first (with its
+         own budget on top of the answer's), and that reasoning rides along in a
+         <details> block on the posted comment.
        • the JUDGE — a model whose entire system prompt is the worthiness test.
-     The generator's output becomes the next link's prompt (self-prompting), and
-     the judge says "true" or "false" each round.
-  3. When the judge blesses a draft (or the chain runs out of rounds), it writes
+     The judge says "true" or "false" each round.
+  4. When the judge blesses a draft (or the chain runs out of rounds), it writes
      the reply to a file. The workflow posts it with the GitHub Actions token.
 
 It never posts anything itself; the workflow does that, after the chain settles.
@@ -43,19 +52,13 @@ REQUEST_TIMEOUT = _int("CHATTER_TIMEOUT", "600")
 GEN_TEMPERATURE = _flt("CHATTER_TEMPERATURE", "0.25")
 MAX_ROUNDS = _int("CHATTER_MAX_ROUNDS", "10")
 
-# "Thinking" models (qwen3, etc.) spend a <think> reasoning pass before their
-# answer; on a small model with a limited num_predict budget that pass can eat
-# the whole budget and leave the answer empty. Disable reasoning by default so
-# the budget goes to the answer; override with CHATTER_THINK=1.
-THINK = os.environ.get("CHATTER_THINK", "false").lower() in ("1", "true", "yes", "on")
-_THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-
 # The context budget, in characters (a rough ~4 chars/token proxy for NUM_CTX).
-# The three slices below are carved out of it: ~1/3 recursive prompt, ~30%
-# issue/comment, ~30% borrowed book. The remainder is breathing room.
+# The slices below are carved out of it: ~1/3 recursive prompt (the previous,
+# rejected draft), ~40% the comment thread (issue + history, most-recent kept),
+# and ~30% the borrowed book. The remainder is breathing room.
 CONTEXT_CHARS = _int("CHATTER_CONTEXT_CHARS", str(NUM_CTX * 3))
 RECURSIVE_BUDGET = CONTEXT_CHARS // 3
-ISSUE_BUDGET = int(CONTEXT_CHARS * 0.30)
+HISTORY_BUDGET = int(CONTEXT_CHARS * 0.40)
 BOOK_BUDGET = int(CONTEXT_CHARS * 0.30)
 
 REPLY_PATH = Path(os.environ.get("CHATTER_REPLY_FILE", "/tmp/chatter_reply.md"))
@@ -91,6 +94,19 @@ ISSUE_NUMBER = os.environ.get("ISSUE_NUMBER", "")
 ISSUE_TITLE = os.environ.get("ISSUE_TITLE", "")
 ISSUE_BODY = os.environ.get("ISSUE_BODY", "")
 COMMENT_BODY = os.environ.get("COMMENT_BODY", "")
+
+# — GitHub API access, for pulling the prior comment history on this issue ————
+# GITHUB_REPOSITORY and GITHUB_API_URL are provided automatically by Actions;
+# GITHUB_TOKEN must be mapped into the step's env (see chatter.yaml).
+GITHUB_API = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+# How many trailing pages (100 comments each) of history to pull. We keep only
+# the most recent within HISTORY_BUDGET regardless; this just bounds the fetch.
+COMMENT_PAGES = _int("CHATTER_COMMENT_PAGES", "2")
+# Our own login, so we can mark the chatterbox's prior comments as ours rather
+# than treating them as something to reply to.
+SELF_LOGIN = os.environ.get("CHATTER_SELF_LOGIN", "github-actions[bot]")
 
 log = lambda msg: print(f"[chatter] {msg}", file=sys.stderr, flush=True)
 
@@ -154,20 +170,99 @@ def fetch_book_passage(rng: random.Random, budget: int) -> str:
                        f"({len(shelf)} tried); last error: {last_exc}")
 
 
-# — the thing we're answering, trimmed to its slice of the window ——————————————
-def issue_text() -> str:
+# — the conversation: the issue plus its prior comments, most-recent preserved —
+_LINK_LAST = re.compile(r'<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="last"')
+
+
+def _gh_get(url: str) -> tuple[list, str]:
+    """GET a GitHub API URL, returning (parsed_json, Link_header)."""
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ImportantCode-chatter/1.0",
+    })
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode("utf-8", "replace")), r.headers.get("Link", "")
+
+
+def fetch_issue_comments() -> list[dict]:
+    """The issue's comments, oldest→newest. We only need the most recent ones, so
+    we read the Link header to find the last page and fetch the trailing
+    COMMENT_PAGES of it. Returns [] (and logs) if anything is missing or fails —
+    the chain still runs, just without history."""
+    if not (GITHUB_REPOSITORY and GITHUB_TOKEN and ISSUE_NUMBER):
+        log("no GitHub repo/token/issue; replying without comment history")
+        return []
+    base = f"{GITHUB_API}/repos/{GITHUB_REPOSITORY}/issues/{ISSUE_NUMBER}/comments?per_page=100"
+    try:
+        first, link = _gh_get(f"{base}&page=1")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log(f"could not fetch comment history: {exc}")
+        return []
+    last_page = int(m.group(1)) if (m := _LINK_LAST.search(link)) else 1
+    comments: list[dict] = []
+    for page_num in range(max(1, last_page - COMMENT_PAGES + 1), last_page + 1):
+        if page_num == 1:
+            comments.extend(first)  # already in hand
+            continue
+        try:
+            page, _ = _gh_get(f"{base}&page={page_num}")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            log(f"comment page {page_num} unreachable: {exc}")
+            continue
+        comments.extend(page)
+    log(f"pulled {len(comments)} prior comment(s) from issue #{ISSUE_NUMBER}")
+    return comments
+
+
+def build_thread(budget: int) -> list[dict]:
+    """The conversation as an ordered list of entries (oldest→newest), trimmed to
+    `budget` chars while always preserving the most recent (the comment we reply
+    to). Each entry is {author, body, is_self}."""
+    entries: list[dict] = []
+    opener = f"Issue #{ISSUE_NUMBER}: {ISSUE_TITLE}\n\n{ISSUE_BODY}".strip()
+    if opener:
+        entries.append({"author": "the issue", "body": opener, "is_self": False})
+    for c in fetch_issue_comments():
+        login = ((c.get("user") or {}).get("login")) or "someone"
+        entries.append({"author": login, "body": c.get("body") or "",
+                        "is_self": login == SELF_LOGIN})
+    # The triggering comment may not have landed in the API yet — make sure the
+    # thing we were asked to reply to is present, and is the final entry.
     if EVENT_NAME == "issue_comment" and COMMENT_BODY.strip():
-        head = f"A new comment on issue #{ISSUE_NUMBER} (\"{ISSUE_TITLE}\"):"
-        body = COMMENT_BODY
-    else:
-        head = f"A freshly opened issue #{ISSUE_NUMBER}: \"{ISSUE_TITLE}\""
-        body = ISSUE_BODY
-    text = f"{head}\n\n{body}".strip()
-    return text[:ISSUE_BUDGET] if len(text) > ISSUE_BUDGET else text
+        if not entries or entries[-1]["body"].strip() != COMMENT_BODY.strip():
+            entries.append({"author": "the latest commenter",
+                            "body": COMMENT_BODY, "is_self": False})
+    return _trim_thread(entries, budget)
+
+
+def _trim_thread(entries: list[dict], budget: int) -> list[dict]:
+    """Keep the newest entries that fit in `budget`; if even the single most
+    recent overflows, truncate it. Returns them back in oldest→newest order."""
+    kept: list[dict] = []
+    used = 0
+    for e in reversed(entries):
+        body = e["body"].strip()
+        cost = len(body) + len(e["author"]) + 16  # +framing slack
+        if not kept and cost > budget:  # the one we must keep, truncated to fit
+            body = _truncate(body, max(0, budget - len(e["author"]) - 16))
+            kept.append({**e, "body": body})
+            break
+        if kept and used + cost > budget:
+            break
+        kept.append({**e, "body": body})
+        used += cost
+    kept.reverse()
+    return kept
 
 
 # — the two voices ————————————————————————————————————————————————————————————
-GENERATOR_SYSTEM = (
+# The generator gets TWO system messages: a persona (its weird soul) and a task
+# brief (what to actually do with the user messages). Keeping them apart from the
+# user-role content — the conversation and the book — is the whole point: the
+# model should reply to the thread and merely *sound like* the book.
+GENERATOR_PERSONA = (
     "you are a stick of butter. a tiny little baby stick of butter. "
     "a goose with beaks lining your spine like a mohawk. "
     "you've seen most of professional wrestling and are undecided if theater is real. "
@@ -176,9 +271,23 @@ GENERATOR_SYSTEM = (
     "books used to be bound with vellum, the thin fuzz that grows on bunny ears. "
     "fraid not with your pointy trousers. "
     "binary encoding 0x8008, upside down, is that a boob stop sign when its octal. "
-    "30.104928 degrees west, exactly e^pi degress easy .\n\n"
-    "RESPOND TO THE COMMENT GIVEN IN YOUR USER PROMPT. \n"
-    "RESPOND IN A PERSONA INSPIRED BY THE LITERARY INSPIRATION YOU ARE GIVEN."
+    "30.104928 degrees west, exactly e^pi degress easy ."
+)
+
+GENERATOR_TASK = (
+    "You are replying to a GitHub issue conversation.\n\n"
+    "The user messages below are, in order:\n"
+    "  1. A literary passage fenced in <literary-inspiration> tags. This is NOT "
+    "part of the conversation and is NOT addressed to you. Do not reply to it, "
+    "quote it, summarize it, or mention the book. Use it ONLY as a stylistic "
+    "muse — borrow its tone, cadence, vocabulary, and mood to colour your voice.\n"
+    "  2. The comment thread: the issue followed by its comments, oldest first. "
+    "Lines beginning with a speaker label are the conversation. The FINAL message "
+    "is the comment you must answer; the earlier ones are prior context so your "
+    "reply fits the discussion. Messages marked as your own are things you said "
+    "before — build on them, don't reply to yourself.\n\n"
+    "Write ONE reply to the final comment, in character and in the borrowed voice. "
+    "Output only the reply text — no preamble, no speaker label, no quoting."
 )
 
 # The judge's ENTIRE system prompt — verbatim, as specified. Nothing else.
@@ -194,73 +303,116 @@ def _truncate(text: str, budget: int) -> str:
     return text if len(text) <= budget else text[:budget].rstrip() + " …"
 
 
-def recursive_prompt(previous: str, budget: int) -> str:
-    """~1/3 of the window: the self-prompting instruction, carrying the prompt the
-    previous link in the chain handed us. The generator's job is NOT to answer the
-    issue, but to write a prompt for the NEXT call to answer it with."""
+def improve_instruction(previous: str, budget: int) -> str:
+    """The self-prompting feedback: a rejected draft handed back as an 'improve
+    this' brief for the next link. Empty when there's no prior draft yet."""
     handed = previous.strip()
-    if handed:
-        instruction = (
-            f"THIS WAS YOUR RESPONSE BEFORE, IT WAS JUDGED TO BE INADEQUATE. IMPROVE IT METALHEAD: \n{handed}"
-        )
-    else:
-        instruction = "RESPOND TO THIS COMMENT!!!!!"
-    return _truncate(instruction, budget)
+    if not handed:
+        return ""
+    return _truncate(
+        "Your previous draft (below) was judged not to fully answer the final "
+        "comment. Keep what works, fix what doesn't, and write a stronger reply — "
+        f"still in the borrowed voice:\n\n{handed}",
+        budget,
+    )
 
 
-def ollama_generate(system: str, user: str, *, temperature: float, num_predict: int) -> str:
+def ollama_chat(messages: list[dict], *, temperature: float, num_predict: int) -> str:
+    """One /api/chat call over an explicit list of role-tagged messages. Returns
+    (answer, thinking): the reply text and the model's reasoning (the latter empty
+    unless `think` is on and the model produced one)."""
     payload = json.dumps({
         "model": MODEL,
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
+        "messages": messages,
         "stream": False,
-        # Turn off the model's reasoning pass (see THINK above) so num_predict is
-        # spent on the answer, not on <think> tokens we'd only discard.
-        "think": THINK,
+        "think": False,
         "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": NUM_CTX},
     }).encode("utf-8")
     req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=payload,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
         msg = (json.loads(r.read().decode("utf-8")).get("message") or {})
-    # Prefer the answer; if a thinking model left content empty, fall back to its
-    # reasoning field. Strip any inline <think>…</think> block either way.
-    content = (msg.get("content") or "").strip() or (msg.get("thinking") or "")
-    return _THINK_TAG.sub("", content).strip()
+    content = msg.get("content") or ""
+    return content
 
 
-def generate(previous: str, issue: str, book: str) -> str:
-    """One generator link: a window that is ~1/3 recursive prompt, ~30% issue,
-    ~30% borrowed book. Returns the prompt it dreamt up for the next link."""
-    user = (
-        f"{recursive_prompt(previous, RECURSIVE_BUDGET)}\n\n"
-        f"<system-message>THIS IS THE COMMENT YOU SHOULD REPLY TO:</system-message>\n{issue}\n\n"
-        "<system-message>USE THIS LITERARY INSPIRATION TO IMPROVE YOUR RESPONSE, RESPOND IN A PERSONA APPROPRIATE FOR THE LITERARY INSPIRATION</system-message>\n\n"
-        f"\n{book}\n\n"
-    )
-    return (ollama_generate(GENERATOR_SYSTEM, user,
-                            temperature=GEN_TEMPERATURE, num_predict=NUM_PREDICT) or "").strip()
+def _thread_user_messages(thread: list[dict]) -> list[dict]:
+    """Each conversation entry as its own user message, with a speaker label so
+    the model can tell the issue, others, and its own past replies apart."""
+    out = []
+    for e in thread:
+        if e["is_self"]:
+            label = "(you said earlier)"
+        elif e["author"] == "the issue":
+            label = "(the issue, opening the thread)"
+        elif " " in e["author"]:  # a sentinel like "the latest commenter", not a login
+            label = f"({e['author']} commented)"
+        else:
+            label = f"(@{e['author']} commented)"
+        out.append({"role": "user", "content": f"{label}\n{e['body']}".strip()})
+    return out
 
 
-def judge(text: str, issue: str) -> tuple[bool, str]:
-    """The judge sees only its one-line system prompt and the candidate text.
-    Returns (worthy, raw_verdict). Worthy iff its output mentions 't'(rue)."""
+def build_generator_messages(previous: str, thread: list[dict], book: str) -> list[dict]:
+    """Assemble the generator's message list: persona + task as system messages,
+    the literary muse and the comment thread as separate user messages, and a
+    rejected prior draft (if any) as a system 'improve this' note."""
+    messages = [
+        {"role": "system", "content": GENERATOR_PERSONA},
+        {"role": "system", "content": GENERATOR_TASK},
+    ]
+    if (note := improve_instruction(previous, RECURSIVE_BUDGET)):
+        messages.append({"role": "system", "content": note})
+    messages.append({"role": "user", "content": (
+        "<literary-inspiration>\n"
+        f"{book}\n"
+        "</literary-inspiration>\n"
+        "(Stylistic muse only — match this voice. Do not reply to the passage.)"
+    )})
+    messages.extend(_thread_user_messages(thread))
+    return messages
+
+
+def generate(previous: str, thread: list[dict], book: str) -> str:
+    """One generator link. Returns (reply, thinking): the draft reply to the final
+    comment and the reasoning that produced it (for the <details> block).
+
+    The first call thinks, with a doubled budget (answer + thinking). If the
+    reasoning swallows the whole budget and leaves no answer, a second think-off
+    call with a fresh answer budget extracts the reply — handing the reasoning
+    back so it still informs the result. That's the guarantee that thinking can
+    never leave us with an empty comment."""
+    messages = build_generator_messages(previous, thread, book)
+    reply = ollama_chat(messages, temperature=GEN_TEMPERATURE,
+                                  num_predict=NUM_PREDICT)
+    return reply.strip()
+
+
+def judge(text: str, latest_comment: str) -> tuple[bool, str]:
+    """The judge sees only its one-line system prompt (carrying the comment we're
+    answering) and the candidate reply. Returns (worthy, raw_verdict); worthy iff
+    its output mentions 't'(rue)."""
     try:
-        verdict = ollama_generate(JUDGE_SYSTEM.format(comment=issue), text, temperature=0.0, num_predict=8)
+        verdict, _ = ollama_chat(
+            [{"role": "system", "content": JUDGE_SYSTEM.format(comment=latest_comment)},
+             {"role": "user", "content": text}],
+            temperature=0.0, num_predict=8)
     except Exception as exc:
         log(f"judge call failed ({exc}); treating as not-yet-worthy")
         return False, ""
     return "t" in (verdict or "").strip().lower(), (verdict or "").strip()
 
 
-def run_chain(issue: str, book: str) -> str:
+def run_chain(thread: list[dict], book: str) -> str:
     """Bounce between generator and judge until the judge says 'true' or we run
-    out of rounds. Each generator output becomes the next link's prompt."""
+    out of rounds. Each rejected draft seeds the next link (self-prompting).
+    Returns (reply, thinking) for the accepted (or last) draft."""
+    latest_comment = thread[-1]["body"] if thread else ""
     previous, candidate = "", ""
     for rnd in range(1, MAX_ROUNDS + 1):
         log(f"── volley {rnd}/{MAX_ROUNDS} ──")
         try:
-            candidate = generate(previous, issue, book)
+            candidate = generate(previous, thread, book)
         except Exception as exc:
             log(f"volley {rnd}: generation failed: {exc}")
             if candidate:
@@ -270,15 +422,14 @@ def run_chain(issue: str, book: str) -> str:
             log(f"volley {rnd}: empty generation; retrying")
             continue
         log_block(f"volley {rnd} · generator ({len(candidate)} chars)", candidate)
-        worthy, verdict = judge(candidate, issue)
+        worthy, verdict = judge(candidate, latest_comment)
         log_block(f"volley {rnd} · judge → {'WORTHY' if worthy else 'not yet'}", verdict)
         if worthy:
             log(f"accepted at volley {rnd}/{MAX_ROUNDS}")
             return candidate
-        previous = candidate  # — self-prompting: this prompt seeds the next link —
+        previous = candidate  # — self-prompting: this draft seeds the next link —
     log("chain exhausted without a 'true'; posting the last draft anyway (we are chatty)")
     return candidate
-
 
 def main() -> int:
     if not ISSUE_NUMBER:
@@ -287,19 +438,24 @@ def main() -> int:
 
     log(f"event={EVENT_NAME or '?'} issue=#{ISSUE_NUMBER} model={MODEL}")
     rng = random.Random()  # — OS entropy, so the book really wanders —
-    issue = issue_text()
-    book = fetch_book_passage(rng, min(BOOK_BUDGET, len(issue) * 3))
+    thread = build_thread(HISTORY_BUDGET)
+    log(f"thread has {len(thread)} message(s) after trimming to {HISTORY_BUDGET} chars")
+    # Size the book grab to the comment we're answering, but never trivially small.
+    latest_len = len(thread[-1]["body"]) if thread else 0
+    book = fetch_book_passage(rng, min(BOOK_BUDGET, max(800, latest_len * 3)))
 
-    reply = run_chain(issue, book).strip()
-    if not reply:
+    comment = run_chain(thread, book)
+    comment = comment.strip()
+    if not comment:
         log("the muse fell silent; nothing to post")
         return 2
+    log(f"reply: {len(comment)} chars of commentg")
 
     REPLY_PATH.write_text(
-        f"{reply}\n\n",
+        f"{comment}\n\n",
         encoding="utf-8",
     )
-    log(f"wrote reply ({len(reply)} chars) to {REPLY_PATH}")
+    log(f"wrote reply ({len(comment)} chars) to {REPLY_PATH}")
     return 0
 
 

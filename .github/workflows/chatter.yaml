@@ -35,6 +35,7 @@ jobs:
 
     steps:
       - name: Decide whether to comment
+        if:  ${{ !contains(github.event.comment.body, '/reply')}}
         run: |
           if ! (( RANDOM % 3 )); then
             exit 1
@@ -72,6 +73,9 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           CHATTER_REPLY_FILE: ${{ runner.temp }}/chatter_reply.md
+          # So the script can pull the prior comment history via the GitHub API.
+          # GITHUB_REPOSITORY and GITHUB_API_URL are provided automatically.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python .github/scripts/chatter.py
 
       - name: Post the reply
