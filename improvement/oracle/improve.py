@@ -423,6 +423,7 @@ def generate_improvement(generate, tree, src_files, issues, *, deadline_seconds=
     produced: dict[str, tuple[Path, str]] = {}
     last = ""
     for insp in inspirations:
+        log(insp)
         if now() >= deadline or len(produced) >= max_files:
             break
         if insp[0] == "issue":
